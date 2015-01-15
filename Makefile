@@ -4,11 +4,12 @@ PROJECT_NAME=moxalist
 
 CC=gcc
 CFLAGS=-c -Wall
+LDOPTS=-lpthread
 
 all: main
 
 main: main.o
-	${CC} main.o -o ${PROJECT_NAME}
+	${CC} $(LDOPTS) main.o -o ${PROJECT_NAME}
 
 main.o: main.c
 	${CC} ${CFLAGS} main.c

@@ -9,10 +9,10 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 #include <net/if_arp.h>
+#include <pthread.h>
+#include <unistd.h>
 
 #include "checksum.h"
-
-//#pragma pack(2)
 
 #define PNAME_MAX_LEN 32
 #define IFACE_MAX_LEN 1024
@@ -21,7 +21,6 @@
 #define MAC_BIN_LEN 6
 #define PORT_STR_LEN 6
 
-//#define SEND_ADDRESS 
 #define SEND_PORT 5800
 #define SEND_SRC_PORT 15800
 #define RCVR_PORT 15802
@@ -30,7 +29,7 @@ struct send_data {
 	u_int16_t w1; // 1 
 	u_int16_t w2; // 1
 	u_int16_t w3; // 0
-	u_int16_t w4; // 32
+		u_int16_t w4; // 32
 	u_int16_t unknown1[6]; // zeros
 	u_int8_t mac_bin[MAC_BIN_LEN];
 	u_int16_t unknown2[5]; // zeros
@@ -43,11 +42,24 @@ struct send_data {
 	char port_str[PORT_STR_LEN];
 } __attribute__ ((packed));
 
+struct recv_data {
+	u_int8_t unknown1[46];
+	char model[33];
+	char ip[IP_ADDR_LEN];
+	char mac[MAC_ADDR_LEN];
+	char mask[IP_ADDR_LEN];
+	char gw[IP_ADDR_LEN];
+	char unknown2[32];
+	char to_ip[IP_ADDR_LEN];
+	char fw[25];
+} __attribute__ ((packed));
+
 char program_name[PNAME_MAX_LEN];
 char iface[IFACE_MAX_LEN];
 char self_ip_address[IP_ADDR_LEN];
 char self_mac_address_str[MAC_ADDR_LEN];
 char self_mac_address_bin[MAC_BIN_LEN];
+static int stop_thread = 0;
 
 int is_iface(char *if_name) {
 	struct ifaddrs *ifs, *tmp;
@@ -97,8 +109,41 @@ void print_usage() {
 	fprintf(stderr, buf, program_name);
 }
 
-void *reciever_func(void *arg) {
+void *receiver_func(void *arg) {
+	int rcvr_sock;
+	struct sockaddr_in receiver;
+	struct recv_data buffer;
+	int read;
+	size_t len = sizeof(receiver);
+	struct timeval tv = { 5, 0 }; // 5 seconds
 	
+	memset(&receiver, 0, sizeof(receiver));
+	receiver.sin_family = AF_INET;
+	receiver.sin_port = htons(RCVR_PORT);
+	receiver.sin_addr.s_addr = htonl(INADDR_ANY);
+
+	if((rcvr_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0) {
+		fprintf(stderr, "Can't create UDP socket (reciever)");
+		pthread_exit(NULL);
+	}
+	if(setsockopt(rcvr_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+		fprintf(stderr, "Can't set socket options (reciever)");
+		pthread_exit(exit);
+	}
+	if(bind(rcvr_sock, (struct sockaddr *)&receiver, len) < 0) {
+		fprintf(stderr, "Can't bind socket (reciever)");
+		pthread_exit(exit);
+	}
+
+	while(!stop_thread) {
+		printf("listening...\n");
+		read = recvfrom(rcvr_sock, &buffer, sizeof(buffer), MSG_WAITALL, (struct sockaddr*)&receiver, &len);
+		if(read >= sizeof(buffer)) {
+			printf("%s\t%s\t%s\t%s\t\%s", buffer.ip, buffer.mac, buffer.mask, buffer.gw, buffer.fw);
+		}
+	}
+	shutdown(rcvr_sock, 2);
+	return NULL;
 }
 
 void fill_data(struct send_data *data) {
@@ -118,8 +163,9 @@ void fill_data(struct send_data *data) {
 int main(int argc, char **argv) {
 	int send_sock;
 	struct send_data data;
-	struct sockaddr_in reciever, src_addr, dst_addr;
+	struct sockaddr_in src_addr, dst_addr;
 	int one = 1;
+	pthread_t receiver_thread;
 
 	set_program_name(basename(argv[0]));
 	if(argc != 2) { /* if not one argument */
@@ -136,8 +182,7 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "Can't create UDP socket");
 		return 3;
 	}
-	if(setsockopt(send_sock, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one)) < 0) // || setsockopt(send_sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0)
-	{
+	if(setsockopt(send_sock, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one)) < 0) {
 		fprintf(stderr, "Can't set socket options");
 		return 3;
 	}
@@ -145,7 +190,15 @@ int main(int argc, char **argv) {
 		shutdown(send_sock, 2);
 		return 4;
 	}
+	/* receiver */
+	if(pthread_create(&receiver_thread, NULL, receiver_func, NULL)) {
+		fprintf(stderr, "Can't create receiver thread");
+		shutdown(send_sock, 2);
+		return 5;
+	}
+	usleep(500000);
 
+	/* sender */
 	fill_data(&data);
 
 	memset(&src_addr, 0, sizeof(src_addr));
@@ -155,7 +208,7 @@ int main(int argc, char **argv) {
 
 	if(bind(send_sock, (struct sockaddr *)&src_addr, sizeof(src_addr)) < 0) {
 		shutdown(send_sock, 2);
-		return 5;
+		return 6;
 	}
 
 	memset(&dst_addr, 0, sizeof(dst_addr));
@@ -163,14 +216,17 @@ int main(int argc, char **argv) {
 	dst_addr.sin_port = htons(SEND_PORT);
 	dst_addr.sin_addr.s_addr = htonl(-1); // 255.255.255.255
 
-	int res = 0;
-	if ((res = sendto(send_sock, &data, sizeof(data), 0, (struct sockaddr *)&dst_addr, sizeof(dst_addr))) < 0) {
-		shutdown(send_sock, 2);
-		return 6;
+	int i;
+	for(i = 0; i < 3; i++) {
+		if (sendto(send_sock, &data, sizeof(data), 0, (struct sockaddr *)&dst_addr, sizeof(dst_addr)) < 0) {
+			fprintf(stderr, "Can't send UDP message");
+		}
+		sleep(1);
 	}
 
-	printf("sent %i octets\n", res);
-
+	stop_thread = 1;
+	void *res;
+	pthread_join(receiver_thread, &res);
 	shutdown(send_sock, 2);
 	return 0;
 }
