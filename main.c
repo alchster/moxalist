@@ -12,8 +12,6 @@
 #include <pthread.h>
 #include <unistd.h>
 
-#include "checksum.h"
-
 #define PNAME_MAX_LEN 32
 #define IFACE_MAX_LEN 1024
 #define IP_ADDR_LEN 16
@@ -54,12 +52,69 @@ struct recv_data {
 	char fw[25];
 } __attribute__ ((packed));
 
+struct access_point {
+	struct access_point *next;
+	char ip[IP_ADDR_LEN];
+	char mask[IP_ADDR_LEN];
+	char gw[IP_ADDR_LEN];
+	char mac[MAC_ADDR_LEN];
+	char fw[25];
+};
+
 char program_name[PNAME_MAX_LEN];
 char iface[IFACE_MAX_LEN];
 char self_ip_address[IP_ADDR_LEN];
 char self_mac_address_str[MAC_ADDR_LEN];
 char self_mac_address_bin[MAC_BIN_LEN];
 static int stop_thread = 0;
+static struct access_point *first_ap = NULL;
+static struct access_point *curr_ap = NULL;
+static const size_t ap_size = sizeof(struct access_point);
+
+
+struct access_point *find_ap(const char *mac) {
+	struct access_point *curr = first_ap, *result = NULL;
+	while(curr) {
+		if(strncmp(mac, curr->mac, MAC_ADDR_LEN) == 0) {
+			result = curr;
+			break;
+		}
+		curr = curr->next;
+	}
+	return result;
+}
+
+void add_access_point(const struct recv_data *ap_info) {
+	struct access_point *curr;
+	if(!find_ap(ap_info->mac)) {
+		curr = malloc(ap_size);
+		memset(curr, 0, ap_size);
+		if(!curr_ap) {
+			first_ap = curr;
+		}
+		else {
+			curr_ap->next = curr;
+		}
+		curr_ap = curr;
+		size_t ip_len = IP_ADDR_LEN*sizeof(char);
+		memcpy(curr_ap->ip, ap_info->ip, ip_len);
+		memcpy(curr_ap->mask, ap_info->mask, ip_len);
+		memcpy(curr_ap->gw, ap_info->gw, ip_len);
+		memcpy(curr_ap->mac, ap_info->mac, MAC_ADDR_LEN*sizeof(char));
+		memcpy(curr_ap->fw, ap_info->fw, 25*sizeof(char));
+	}
+}
+
+void print_and_free_aps_list () {
+	struct access_point *curr;
+	struct access_point *next = first_ap;
+	while(next) {
+		curr = next;
+		printf("%s\t%s\t%s\t%s\t\%s\n", curr->mac, curr->ip, curr->mask, curr->gw, curr->fw);
+		next = curr->next;
+		free(curr);
+	}
+}
 
 int is_iface(char *if_name) {
 	struct ifaddrs *ifs, *tmp;
@@ -115,7 +170,7 @@ void *receiver_func(void *arg) {
 	struct recv_data buffer;
 	int read;
 	size_t len = sizeof(receiver);
-	struct timeval tv = { 5, 0 }; // 5 seconds
+	struct timeval tv = { 5, 0 }; // wait 5 seconds for data
 	
 	memset(&receiver, 0, sizeof(receiver));
 	receiver.sin_family = AF_INET;
@@ -136,10 +191,11 @@ void *receiver_func(void *arg) {
 	}
 
 	while(!stop_thread) {
-		printf("listening...\n");
-		read = recvfrom(rcvr_sock, &buffer, sizeof(buffer), MSG_WAITALL, (struct sockaddr*)&receiver, &len);
-		if(read >= sizeof(buffer)) {
-			printf("%s\t%s\t%s\t%s\t\%s", buffer.ip, buffer.mac, buffer.mask, buffer.gw, buffer.fw);
+		memset((void *)&buffer, 0, sizeof(buffer));
+		read = recvfrom(rcvr_sock, &buffer, sizeof(buffer), 0, (struct sockaddr*)&receiver, &len);
+		if(read > 0) {
+	//		printf("%s\t%s\t%s\t%s\t\%s\n", buffer.mac, buffer.ip, buffer.mask, buffer.gw, buffer.fw);
+			add_access_point(&buffer);
 		}
 	}
 	shutdown(rcvr_sock, 2);
@@ -218,6 +274,7 @@ int main(int argc, char **argv) {
 
 	int i;
 	for(i = 0; i < 3; i++) {
+//		printf("sending...\n");
 		if (sendto(send_sock, &data, sizeof(data), 0, (struct sockaddr *)&dst_addr, sizeof(dst_addr)) < 0) {
 			fprintf(stderr, "Can't send UDP message");
 		}
@@ -228,5 +285,7 @@ int main(int argc, char **argv) {
 	void *res;
 	pthread_join(receiver_thread, &res);
 	shutdown(send_sock, 2);
+
+	print_and_free_aps_list();
 	return 0;
 }
